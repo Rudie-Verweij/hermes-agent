@@ -195,3 +195,44 @@ def test_stepup_declined_grant_does_not_replay(cli, monkeypatch, capsys):
 
     assert calls["n"] == 1  # applied once, grant denied, no replay
     assert "Couldn't enable terminal billing" in out
+
+
+def test_unknown_preview_effect_fails_safe(cli, monkeypatch, capsys):
+    # An unrecognized effect string must NOT schedule a real change (fail safe).
+    cli._app = object()
+    monkeypatch.setattr(sv, "build_subscription_state", lambda *a, **kw: _sub_state())
+    monkeypatch.setattr(HermesCLI, "_prompt_text_input_modal", _scripted_modal("change", "plus"), raising=False)
+    monkeypatch.setattr(nb, "post_subscription_preview", lambda **kw: {"effect": "weird_unknown", "targetTierName": "Plus"})
+    put = {"n": 0}
+    monkeypatch.setattr(nb, "put_subscription_pending_change", lambda **kw: put.update(n=put["n"] + 1) or {})
+
+    cli._show_subscription()
+    out = capsys.readouterr().out
+
+    assert put["n"] == 0  # no mutation on an unknown effect
+    assert "portal" in out.lower()
+
+
+def test_bounded_stepup_does_not_loop_on_repeat_denial(cli, monkeypatch, capsys):
+    # Grant "succeeds" but the scope stays denied → replay ONCE (allow_stepup=False),
+    # then stop — no re-prompt / re-open-browser loop.
+    cli._app = object()
+    monkeypatch.setattr(sv, "build_subscription_state", lambda *a, **kw: _sub_state())
+    monkeypatch.setattr(HermesCLI, "_prompt_text_input_modal", _scripted_modal("change", "plus", "yes", "yes"), raising=False)
+    monkeypatch.setattr(nb, "post_subscription_preview", lambda **kw: {"effect": "scheduled", "targetTierName": "Plus", "effectiveAt": "2026-07-28"})
+    calls = {"n": 0}
+
+    def _put(**kw):
+        calls["n"] += 1
+        raise nb.BillingScopeRequired("still no scope")
+
+    monkeypatch.setattr(nb, "put_subscription_pending_change", _put)
+    import hermes_cli.auth as auth
+
+    monkeypatch.setattr(auth, "step_up_nous_billing_scope", lambda **kw: True, raising=False)
+
+    cli._show_subscription()
+    out = capsys.readouterr().out
+
+    assert calls["n"] == 2  # applied, granted, replayed once — no third attempt
+    assert "still isn't enabled" in out

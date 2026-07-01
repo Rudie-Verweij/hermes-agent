@@ -9757,13 +9757,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         c = state.current
         has_pending = bool(c and (c.cancel_at_period_end or c.pending_downgrade_tier_name))
         keep_name = (c.tier_name if c else None) or "your plan"
-        choices = [("change", "Change plan", "upgrade or downgrade in the terminal")]
+        # When a change is already scheduled, undo is the most likely next intent →
+        # promote it first (parity with the TUI). The Close row uses value "close"
+        # (not "cancel") so typing the word "cancel" — which the alias table would
+        # map to a Close row — can't be confused with "Cancel subscription".
         if has_pending:
-            choices.append(("keep", f"Keep {keep_name} (undo the scheduled change)", "cancel the pending change"))
+            choices = [
+                ("keep", f"Keep {keep_name} (undo the scheduled change)", "cancel the pending change"),
+                ("change", "Change plan", "upgrade or downgrade in the terminal"),
+            ]
         else:
-            choices.append(("cancel_sub", "Cancel subscription", "schedule cancellation at period end"))
+            choices = [
+                ("change", "Change plan", "upgrade or downgrade in the terminal"),
+                ("cancel_sub", "Cancel subscription", "schedule cancellation at period end"),
+            ]
         choices.append(("portal", "Manage on portal", "open the billing page in your browser"))
-        choices.append(("cancel", "Close", "do nothing"))
+        choices.append(("close", "Close", "do nothing"))
         raw = self._prompt_text_input_modal(title="Manage your subscription", detail="", choices=choices)
         choice = self._normalize_slash_confirm_choice(raw, choices)
         if choice == "change":
@@ -9775,7 +9784,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         elif choice == "portal":
             self._subscription_open_portal(state, manage_url)
         else:
-            print("  🟡 Cancelled. No plan change.")
+            print("  🟡 Closed. No plan change.")
 
     def _subscription_pick_tier(self, state):
         """Tier picker → preview → confirm (mirrors the TUI picker screen)."""
@@ -9809,8 +9818,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             return
         self._subscription_preview_and_confirm(state, choice)
 
-    def _subscription_preview_and_confirm(self, state, tier_id):
-        """Preview the change (chargeless quote), show the effect, then confirm+apply."""
+    def _subscription_preview_and_confirm(self, state, tier_id, *, allow_stepup=True):
+        """Preview the change (chargeless quote), show the effect, then confirm+apply.
+
+        ``allow_stepup=False`` (a post-grant replay) declines a second step-up on a
+        repeated scope denial so the flow can't re-prompt/re-open the browser in a
+        loop.
+        """
         from agent.subscription_view import subscription_change_preview_from_payload
         from hermes_cli.nous_billing import BillingError, BillingScopeRequired, post_subscription_preview
 
@@ -9818,7 +9832,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         try:
             payload = post_subscription_preview(subscription_type_id=tier_id)
         except BillingScopeRequired:
-            self._subscription_handle_scope_required(state, retry=("preview", tier_id))
+            if allow_stepup:
+                self._subscription_handle_scope_required(state, retry=("preview", tier_id))
+            else:
+                print("  Terminal billing still isn't enabled for this org — enable it on the portal, then retry.")
             return
         except BillingError as exc:
             self._subscription_render_error(state, exc)
@@ -9830,8 +9847,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if effect == "no_op":
             _cprint(f"  {_d(f'You are already on {target} — nothing to change.')}")
             return
-        if effect == "blocked":
-            _cprint(f"  🟡 {p.reason or 'That change cannot be made here — manage it on the portal.'}")
+        if effect not in ("charge_now", "scheduled"):
+            # blocked OR an unknown/unexpected effect → fail SAFE (never schedule a
+            # real change on an unrecognized string, unlike a bare `else`), and
+            # re-offer the portal hand-off like the TUI's blocked branch.
+            from agent.subscription_view import subscription_manage_url
+
+            _cprint(f"  🟡 {p.reason or 'This change cannot be confirmed here — manage it on the portal.'}")
+            _mu = subscription_manage_url(state)
+            if _mu:
+                print(f"  Manage on portal: {_mu}")
             return
         if effect == "charge_now":
             _amt = f"${p.amount_due_now_cents / 100:.2f}" if p.amount_due_now_cents is not None else None
@@ -9843,18 +9868,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _cprint(f"  {_d('The card on your subscription will be charged.')}")
             pay_label = f"Pay {_amt} & upgrade now" if _amt else "Upgrade now (prorated charge)"
             action = ("upgrade", tier_id)
-        else:  # scheduled
+            # The money-moving row is NOT the default — a bare Enter hits "Go back",
+            # so a single stray keystroke can't charge the card.
+            confirm_choices = [
+                ("cancel", "Go back", "do not charge"),
+                ("yes", pay_label, "charge + upgrade now"),
+            ]
+        else:  # scheduled (whitelisted above)
             _when = p.effective_at[:10] if (p.effective_at and len(p.effective_at) >= 10) else "the end of the billing period"
             _cprint(f"  {_b('Confirm plan change')}  {_d('· scheduled · not today')}")
             _cprint(f"  Change to {target} — takes effect {_when}. No charge now; you keep your current plan until then.")
             pay_label = f"Schedule change to {target}"
             action = ("schedule", tier_id)
+            confirm_choices = [
+                ("yes", pay_label, "apply this change"),
+                ("cancel", "Go back", "do not change"),
+            ]
         if p.monthly_credits_delta:
             _cprint(f"  {_d(f'Monthly credits change: {p.monthly_credits_delta}.')}")
-        confirm_choices = [
-            ("yes", pay_label, "apply this change"),
-            ("cancel", "Go back", "do not change"),
-        ]
         raw = self._prompt_text_input_modal(title=pay_label, detail="", choices=confirm_choices)
         if self._normalize_slash_confirm_choice(raw, confirm_choices) != "yes":
             print("  🟡 Cancelled. No plan change.")
@@ -9881,12 +9912,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             return
         self._subscription_apply(state, ("cancel", None))
 
-    def _subscription_apply(self, state, action, idempotency_key=None):
+    def _subscription_apply(self, state, action, idempotency_key=None, *, allow_stepup=True):
         """Run the mutation for `action`, handling the scope step-up + the result.
 
         `action` is one of ("upgrade", tier_id) / ("schedule", tier_id) /
         ("cancel", None) / ("resume", None). insufficient_scope routes to the
         step-up and replays; the upgrade idempotency key is reused across the replay.
+        ``allow_stepup=False`` (a post-grant replay) declines a second step-up on a
+        repeated scope denial so the flow can't re-prompt/re-open the browser in a loop.
         """
         from hermes_cli.nous_billing import (
             BillingError,
@@ -9934,7 +9967,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 _cprint(f"  {_DIM}✓ Undone — you stay on your current plan.{_RST}")
             _cprint(f"  {_d('Re-run /subscription anytime to review it.')}")
         except BillingScopeRequired:
-            self._subscription_handle_scope_required(state, retry=action, idempotency_key=key)
+            if allow_stepup:
+                self._subscription_handle_scope_required(state, retry=action, idempotency_key=key)
+            else:
+                print("  Terminal billing still isn't enabled for this org — enable it on the portal, then retry.")
         except BillingError as exc:
             self._subscription_render_error(state, exc)
 
@@ -9975,7 +10011,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             print("  Couldn't enable terminal billing — an org admin or owner has to approve it for this org.")
             return
         _cprint(f"  {_DIM}✓ Terminal billing enabled.{_RST}")
-        # Re-fetch fresh state, then replay the held action.
+        # Bust the 30s token cache so the replay uses the freshly-scoped token. The
+        # cache still holds the pre-grant unscoped token, and _request only busts it
+        # on a 401 (not a 403 scope denial) — without this, the replay would 403
+        # again and (before the allow_stepup guard) re-prompt in a loop.
+        try:
+            from hermes_cli import nous_billing as _nb
+
+            _nb._token_cache = None
+        except Exception:
+            pass
+        # Re-fetch fresh state, then replay the held action ONCE (allow_stepup=False
+        # so a repeated scope denial can't re-enter the step-up).
         from agent.subscription_view import build_subscription_state
 
         try:
@@ -9984,9 +10031,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             fresh = state
         rkind, rarg = retry
         if rkind == "preview":
-            self._subscription_preview_and_confirm(fresh, rarg)
+            self._subscription_preview_and_confirm(fresh, rarg, allow_stepup=False)
         else:
-            self._subscription_apply(fresh, retry, idempotency_key=idempotency_key)
+            self._subscription_apply(fresh, retry, idempotency_key=idempotency_key, allow_stepup=False)
 
     def _subscription_render_error(self, state, exc):
         """Render a subscription BillingError (a lighter _billing_render_charge_error)."""
