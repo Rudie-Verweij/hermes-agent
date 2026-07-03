@@ -3945,6 +3945,108 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
+    def _callback_relays(self) -> List[Dict[str, Any]]:
+        """External callback relays from platform config `extra.callback_relays` (list of
+        {prefix, url, headers?, header_env?, timeout?}). header_env maps header names to
+        ENV VAR NAMES so secrets stay in the profile .env, not in config.yaml."""
+        extra = getattr(self.config, "extra", None)
+        if not extra:
+            return []
+        relays = extra.get("callback_relays") or []
+        return [r for r in relays if isinstance(r, dict)]
+
+    async def _handle_external_relay_callback(
+        self,
+        query: "CallbackQuery",
+        data: str,
+        relay: Dict[str, Any],
+        *,
+        query_chat_id: Any = None,
+        query_chat_type: Any = None,
+        query_thread_id: Any = None,
+        query_user_name: Any = None,
+    ) -> None:
+        """Forward an externally-minted button tap to its owning service; display the result.
+
+        The remote service owns the decision (it verifies its own signed callback token);
+        this gateway only gates on its authorized-user list and never interprets `data`.
+        Response contract: JSON {ack: str, alert?: bool, edit?: str}.
+        """
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to answer this prompt.")
+            return
+
+        url = str(relay.get("url") or "")
+        if not url:
+            logger.warning("[%s] callback relay %r has no url", self.name, relay.get("prefix"))
+            await query.answer(text="Relay misconfigured.")
+            return
+        headers = {str(k): str(v) for k, v in (relay.get("headers") or {}).items()}
+        for header, env_name in (relay.get("header_env") or {}).items():
+            value = os.getenv(str(env_name), "")
+            if value:
+                headers[str(header)] = value
+
+        message = getattr(query, "message", None)
+        payload = {
+            "callback_query": {
+                "id": str(getattr(query, "id", "")),
+                "data": data,
+                "from": {
+                    "id": getattr(query.from_user, "id", None),
+                    "first_name": getattr(query.from_user, "first_name", None),
+                    "username": getattr(query.from_user, "username", None),
+                },
+                "message": (
+                    {
+                        "message_id": getattr(message, "message_id", None),
+                        "chat": {"id": getattr(message, "chat_id", None)},
+                    }
+                    if message is not None
+                    else None
+                ),
+            }
+        }
+
+        try:
+            import httpx
+
+            timeout = float(relay.get("timeout", 15.0))
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                resp.raise_for_status()
+                result: Dict[str, Any] = resp.json() if resp.content else {}
+        except Exception as exc:
+            logger.warning(
+                "[%s] callback relay %r failed: %s", self.name, relay.get("prefix"), exc
+            )
+            await query.answer(
+                text="Approval service unreachable — try again.", show_alert=True
+            )
+            return
+
+        ack = str(result.get("ack") or "Done.")
+        try:
+            await query.answer(text=ack[:200], show_alert=bool(result.get("alert")))
+        except Exception:
+            pass
+        edit = result.get("edit")
+        if edit and message is not None:
+            try:
+                await query.edit_message_text(
+                    text=f"{getattr(message, 'text', '') or ''}\n\n{edit}",
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -3966,6 +4068,25 @@ class TelegramAdapter(BasePlatformAdapter):
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)
             return
+
+        # --- External callback relays (config: telegram extra.callback_relays) ---
+        # Buttons minted OUTSIDE this gateway (e.g. the Pro-spect CRM Worker's one-tap
+        # approvals, prefix "pa1:") — the tap is forwarded verbatim to the owning service,
+        # which verifies its own signed callback token and decides. The gateway is a dumb
+        # relay: authorize the tapper, forward, display the returned ack/edit.
+        for relay in self._callback_relays():
+            relay_prefix = str(relay.get("prefix") or "")
+            if relay_prefix and data.startswith(relay_prefix):
+                await self._handle_external_relay_callback(
+                    query,
+                    data,
+                    relay,
+                    query_chat_id=query_chat_id,
+                    query_chat_type=query_chat_type,
+                    query_thread_id=query_thread_id,
+                    query_user_name=query_user_name,
+                )
+                return
 
         # --- Gmail-triage callbacks (gt:verb:arg) ---
         if data.startswith("gt:"):
