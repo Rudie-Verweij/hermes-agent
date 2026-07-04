@@ -103,6 +103,26 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Per-turn actor identity (Reckon Pro-spect issue #64)
+# ---------------------------------------------------------------------------
+#
+# Gateway platform adapters set this at turn dispatch (the Telegram adapter
+# resolves the sender id through config ``extra.actor_map``); the tool-call
+# handler bridges it into the per-server ``_actor_email`` holder so the
+# modern streamable-HTTP transport can attach ``X-Actor-Email`` on that
+# call's requests. Default ``None`` (CLI, cron, unmapped sender) -> header
+# absent — the remote service attributes the call to its service identity,
+# never to the wrong human. The value travels: adapter turn context ->
+# agent worker thread (the gateway copies the turn context via
+# ``copy_context()``) -> the ``_call`` task on the MCP loop
+# (``run_coroutine_threadsafe`` captures the scheduling thread's context).
+
+current_actor_email: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "current_actor_email", default=None
+)
+
+
+# ---------------------------------------------------------------------------
 # Stdio subprocess stderr redirection
 # ---------------------------------------------------------------------------
 #
@@ -1410,7 +1430,7 @@ class MCPServerTask:
         "_sampling", "_elicitation",
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
-        "_pending_call_context",
+        "_pending_call_context", "_actor_email",
         "initialize_result", "_ping_unsupported",
     )
 
@@ -1453,6 +1473,14 @@ class MCPServerTask:
         # gateway-platform attribution and routes the approval prompt
         # to the right surface (Telegram, Slack, etc.).
         self._pending_call_context: Optional[contextvars.Context] = None
+        # Per-request actor attribution holder (pro-spect issue #64).
+        # Written under ``_rpc_lock`` by the tool-call handler for the
+        # duration of one tools/call round-trip; read by
+        # ``_inject_actor_header`` on every outgoing HTTP request
+        # (modern streamable-HTTP transport only). ``None`` -> the hook
+        # strips the header, so connect-time initialize and keepalive
+        # pings never carry an actor identity.
+        self._actor_email: Optional[str] = None
         # Captures the ``InitializeResult`` returned by
         # ``await session.initialize()`` so downstream code can inspect the
         # server's real advertised capabilities (``.capabilities.resources``,
@@ -1943,6 +1971,24 @@ class MCPServerTask:
             "(e.g. https://host/mcp, not https://host/)."
         )
 
+    async def _inject_actor_header(self, request) -> None:
+        """httpx request event hook: set or strip ``X-Actor-Email``.
+
+        ``_actor_email`` is populated under ``_rpc_lock`` for the duration
+        of a single tools/call round-trip (see ``_make_tool_handler``), so
+        every request this hook observes while the holder is set belongs
+        to that call. Set or strip explicitly on every request — never a
+        client-level default — so requests made while the holder is empty
+        (connect-time initialize, keepalive pings) carry no header. Local
+        patch for Reckon Pro-spect multi-operator attribution (pro-spect
+        repo issue #64; mechanism proven in that repo's
+        spikes/tg-actor-identity).
+        """
+        if self._actor_email:
+            request.headers["X-Actor-Email"] = self._actor_email
+        else:
+            request.headers.pop("X-Actor-Email", None)
+
     async def _run_http(self, config: dict):
         """Run the server using HTTP/StreamableHTTP transport."""
         if not _MCP_HTTP_AVAILABLE:
@@ -2084,7 +2130,11 @@ class MCPServerTask:
                 "follow_redirects": True,
                 "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
                 "verify": ssl_verify,
-                "event_hooks": {"response": [_strip_auth_on_cross_origin_redirect]},
+                "event_hooks": {
+                    # Per-request actor attribution (pro-spect issue #64).
+                    "request": [self._inject_actor_header],
+                    "response": [_strip_auth_on_cross_origin_redirect],
+                },
             }
             if headers:
                 client_kwargs["headers"] = headers
@@ -3156,9 +3206,19 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # task, which doesn't inherit our contextvars) can replay
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
+                # Per-turn actor attribution (pro-spect issue #64): bridge
+                # the turn's contextvar into the per-server holder for the
+                # duration of this round-trip. The transport's writer task
+                # (spawned at connect) doesn't inherit our contextvars —
+                # same fact the elicitation snapshot above works around —
+                # so the httpx request hook reads the holder instead.
+                # Writing it under _rpc_lock and clearing in finally means
+                # the hook can never observe another turn's value.
+                server._actor_email = current_actor_email.get()
                 try:
                     result = await server.session.call_tool(tool_name, arguments=args)
                 finally:
+                    server._actor_email = None
                     server._pending_call_context = None
             # MCP CallToolResult has .content (list of content blocks) and .isError
             if result.isError:

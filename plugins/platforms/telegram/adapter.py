@@ -6090,6 +6090,54 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
+    def _actor_email_for_user(self, user_id: Any) -> Optional[str]:
+        """Operator email for a Telegram sender id via config ``extra.actor_map``
+        ({tg-id -> email}). Unmapped or missing sender -> None. Local patch for
+        Reckon Pro-spect multi-operator attribution (pro-spect repo issue #64)."""
+        if not user_id:
+            return None
+        extra = getattr(self.config, "extra", None)
+        if not extra:
+            return None
+        actor_map = extra.get("actor_map") or {}
+        if not isinstance(actor_map, dict):
+            return None
+        email = actor_map.get(str(user_id))
+        if not email:
+            return None
+        return str(email).strip() or None
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        """Bind the sender's operator identity for this turn, then dispatch.
+
+        Resolves ``event.source.user_id`` through ``extra.actor_map`` and
+        publishes it via the ``current_actor_email`` contextvar so MCP tool
+        calls made during this turn attach ``X-Actor-Email`` (see
+        tools/mcp_tool.py). The contextvar is set before the base class
+        spawns the processing task (task creation copies the current
+        context) and reset on return. Unmapped sender -> ``None`` -> no
+        header: the remote service falls back to its service identity,
+        never a wrong human (fail closed). Pro-spect repo issue #64.
+        """
+        _actor_var = None
+        _actor_token = None
+        try:
+            from tools.mcp_tool import current_actor_email
+
+            _actor_var = current_actor_email
+            _actor_token = _actor_var.set(
+                self._actor_email_for_user(getattr(event.source, "user_id", None))
+            )
+        except Exception:
+            # Attribution must never take a turn down — proceed without an
+            # actor identity (remote attributes to its service identity).
+            logger.debug("[%s] actor identity bind failed", self.name, exc_info=True)
+        try:
+            await super().handle_message(event)
+        finally:
+            if _actor_var is not None and _actor_token is not None:
+                _actor_var.reset(_actor_token)
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
