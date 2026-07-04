@@ -831,10 +831,13 @@ def _install_neutts_deps() -> bool:
 
     # Ensure pip is available — some venvs are created without pip (e.g. Ubuntu 25.10)
     try:
-        import importlib
+        import importlib.util
         if importlib.util.find_spec("pip") is None:
             print_info("pip not found in venv — bootstrapping with ensurepip...")
-            subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"], check=True, timeout=30)
+            subprocess.run(
+                [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
+                check=True, timeout=60,
+            )
             print_success("pip bootstrapped successfully")
     except Exception as e:
         print_warning(f"Could not bootstrap pip: {e}")
