@@ -507,3 +507,104 @@ class TestRichAwareOverflow:
         assert consumer._message_id == "final1"
         assert consumer._preview_message_ids == set()
         assert consumer.final_response_sent is True
+
+
+class TestRichEditOverflowSealing:
+    """A growing reply must be sealed at the legacy plain-edit limit even when
+    the rich streaming_overflow_limit raised the accumulation budget.
+
+    Regression: with the budget raised to 32,768, mid-stream edits kept
+    passing the FULL accumulated text to adapter.edit_message once it grew
+    past 4,096.  Telegram's adapter then split-and-delivered continuations on
+    every edit tick while the consumer still held the full text — each tick
+    re-delivered the head of the answer as a fresh duplicate message.
+    """
+
+    def _cfg(self):
+        return StreamConsumerConfig(
+            transport="auto", chat_type="dm",
+            edit_interval=0.01, buffer_threshold=5, cursor="",
+        )
+
+    @pytest.mark.asyncio
+    async def test_growing_reply_seals_at_legacy_limit_no_duplicates(self):
+        from gateway.platforms.base import SendResult
+
+        adapter = _make_rich_capable_adapter(send_results=[
+            SendResult(success=True, message_id="m1"),
+            SendResult(success=True, message_id="m2"),
+        ])
+        # Mirror real Telegram: no fresh-final re-send while streaming.
+        adapter.prefers_fresh_final_streaming = lambda content, metadata=None: False
+        consumer = GatewayStreamConsumer(adapter, "12345", self._cfg())
+
+        head = "A" * 3000
+        tail = "B" * 2000
+
+        consumer.on_delta(head)
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.05)  # first tick: preview m1 holds the head
+        consumer.on_delta(tail)
+        await asyncio.sleep(0.05)  # growth tick: crosses the 4,096 edit limit
+        consumer.finish()
+        await task
+
+        # No plain edit may ever carry over-limit content — that is what made
+        # the adapter split-and-deliver duplicates on every tick.
+        for call in adapter.edit_message.await_args_list:
+            content = call.kwargs.get("content", "")
+            assert len(content) <= 4096, (
+                f"plain edit carried over-limit content ({len(content)} chars)"
+            )
+
+        # Reconstruct the final on-screen state: last edit per message id,
+        # falling back to the original send content.
+        screen = {}
+        for call in adapter.send.await_args_list:
+            mid = "m1" if not screen else "m2"
+            screen[mid] = call.kwargs.get("content", "")
+        for call in adapter.edit_message.await_args_list:
+            screen[call.kwargs.get("message_id")] = call.kwargs.get("content", "")
+
+        combined = "".join(screen[mid] for mid in sorted(screen))
+        # The full reply is delivered exactly once, in order — no duplicated
+        # head, no dropped tail.
+        assert combined == head + tail
+
+    @pytest.mark.asyncio
+    async def test_got_done_overflow_finalizes_in_one_edit(self):
+        from gateway.platforms.base import SendResult
+
+        adapter = _make_rich_capable_adapter(send_results=[
+            SendResult(success=True, message_id="m1"),
+        ])
+        adapter.prefers_fresh_final_streaming = lambda content, metadata=None: False
+        consumer = GatewayStreamConsumer(adapter, "12345", self._cfg())
+
+        head = "A" * 3000
+        tail = "B" * 2000
+
+        consumer.on_delta(head)
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.05)  # preview m1 holds the head
+        # Growth and stream end arrive in the same drain: the got_done
+        # exemption must skip mid-stream sealing and let the single finalize
+        # edit deliver the whole reply (rich in-place edit / one-shot adapter
+        # overflow split — either way it runs exactly once, so it cannot
+        # duplicate).
+        consumer.on_delta(tail)
+        consumer.finish()
+        await task
+
+        assert adapter.send.await_count == 1
+        finalize_edits = [
+            c for c in adapter.edit_message.await_args_list
+            if c.kwargs.get("finalize")
+        ]
+        # REQUIRES_EDIT_FINALIZE adapters may re-finalize the same message
+        # (a "not modified" no-op on the platform) — what matters is that
+        # every finalize edit targets the SAME message with the WHOLE reply,
+        # never a mid-stream seal that fragments it.
+        assert finalize_edits
+        assert {c.kwargs.get("message_id") for c in finalize_edits} == {"m1"}
+        assert {c.kwargs.get("content") for c in finalize_edits} == {head + tail}

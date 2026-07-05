@@ -456,6 +456,19 @@ class GatewayStreamConsumer:
         # isn't fragmented at 4096 while streaming.  See _raw_message_limit.
         _raw_limit = self._raw_message_limit()
         _safe_limit = max(500, _raw_limit - _len_fn(self.cfg.cursor) - 100)
+        # Plain (non-rich) edits are still capped at the legacy per-message
+        # limit even when _safe_limit was raised to the rich cap: mid-stream
+        # edits go through adapter.edit_message without rich rendering, so
+        # content that grows past MAX_MESSAGE_LENGTH must be sealed off at
+        # this budget instead (see the seal loop below).
+        _legacy_raw = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
+        if not isinstance(_legacy_raw, int):
+            # MagicMock adapters in tests return auto-attributes here.
+            _legacy_raw = 4096
+        _edit_safe_limit = max(500, _legacy_raw - _len_fn(self.cfg.cursor) - 100)
+        # True when a rich-capable adapter raised the accumulation budget past
+        # the plain-edit budget; only then do the rich exemptions below apply.
+        _rich_streaming = _safe_limit > _edit_safe_limit
 
         # Resolve native draft streaming once per run.  When enabled the
         # consumer routes mid-stream frames through adapter.send_draft and
@@ -564,17 +577,48 @@ class GatewayStreamConsumer:
 
                     # Existing message: edit it with the first chunk, then
                     # start a new message for the overflow remainder.
+                    #
+                    # Seal at the LEGACY edit budget (_edit_safe_limit), not the
+                    # rich-raised _safe_limit: mid-stream edits are plain
+                    # editMessageText calls capped at MAX_MESSAGE_LENGTH.  If the
+                    # consumer kept passing the full over-limit text, the adapter
+                    # would split-and-deliver continuations on EVERY edit tick
+                    # while _accumulated still holds the full text — each tick
+                    # re-delivering the head as a fresh duplicate message.
+                    #
+                    # Two exemptions (rich streaming only) keep replies that fit
+                    # ONE rich message whole:
+                    #   * got_done — the finalize edit below handles overflow in a
+                    #     single shot (rich in-place edit when eligible, otherwise
+                    #     the adapter's one-time overflow split); no repeat edits
+                    #     can follow, so no duplication is possible.
+                    #   * an over-limit preview already on screen — the adapter
+                    #     accepted a whole over-limit send (rich path), so sealing
+                    #     now would fragment a message the platform can finalize
+                    #     in place.
+                    # When rich streaming is off, _edit_safe_limit == _safe_limit
+                    # and neither exemption applies, so behavior is unchanged.
                     while (
-                        _len_fn(self._accumulated) > _safe_limit
+                        _len_fn(self._accumulated) > _edit_safe_limit
+                        and not (
+                            _rich_streaming
+                            and (
+                                got_done
+                                or (
+                                    self._last_sent_text
+                                    and _len_fn(self._last_sent_text) > _edit_safe_limit
+                                )
+                            )
+                        )
                         and self._message_id is not None
                         and self._edit_supported
                     ):
                         _cp_budget = _custom_unit_to_cp(
-                            self._accumulated, _safe_limit, _len_fn,
+                            self._accumulated, _edit_safe_limit, _len_fn,
                         )
                         split_at = self._accumulated.rfind("\n", 0, _cp_budget)
-                        if split_at < _safe_limit // 2:
-                            split_at = _safe_limit
+                        if split_at < _edit_safe_limit // 2:
+                            split_at = _edit_safe_limit
                         chunk = self._accumulated[:split_at]
                         # finalize=True so the adapter applies platform-specific
                         # rich-text markup (e.g. Telegram MarkdownV2). This
